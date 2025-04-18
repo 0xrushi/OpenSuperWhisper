@@ -1,0 +1,7 @@
+[
+    {"from": "colour", "to": "color"},
+    {"from": "favourite", "to": "favorite"},
+    {"from": "organisation", "to": "organization"},
+    {"from": "cancelled", "to": "canceled"},
+    {"from": "link calendar", "to": "https://cal.com/0xrushi"}
+]
