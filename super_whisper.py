@@ -7,6 +7,10 @@ from pynput.keyboard import Controller as KeyController
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import Qt, pyqtSignal, QThread
 import pyqtgraph as pg
+import asyncio
+from PyQt5 import QtGui
+import os
+
 
 # No local ASR: use remote whisper_online_server
 # Constants for audio
@@ -113,6 +117,7 @@ class HotkeyListener(QThread):
         super().__init__()
         self.window = window
         self.ctrl = False
+        self.shift = False
         self.listener = None
 
     def run(self):
@@ -129,18 +134,24 @@ class HotkeyListener(QThread):
         from pynput.keyboard import Key
         if key in (Key.ctrl_l, Key.ctrl_r):
             self.ctrl = True
-        elif key == Key.space and self.ctrl:
-            QtCore.QMetaObject.invokeMethod(self.window, '_start_recording', Qt.QueuedConnection)
+        elif key in (Key.shift_l, Key.shift_r):
+            self.shift = True
+        elif key == Key.space:
+            if self.ctrl and self.shift:
+                # Ctrl+Shift+Space pressed
+                QtCore.QMetaObject.invokeMethod(self.window, '_correct_selected_text', Qt.QueuedConnection)
+            elif self.ctrl:
+                # Ctrl+Space pressed
+                QtCore.QMetaObject.invokeMethod(self.window, '_start_recording', Qt.QueuedConnection)
         elif key == Key.esc:
             QtCore.QMetaObject.invokeMethod(self.window, 'close', Qt.QueuedConnection)
-        elif key == Key.esc:
-            QtCore.QMetaObject.invokeMethod(self.window, '_close_window', Qt.QueuedConnection)
-
 
     def on_release(self, key):
         from pynput.keyboard import Key
         if key in (Key.ctrl_l, Key.ctrl_r):
             self.ctrl = False
+        elif key in (Key.shift_l, Key.shift_r):
+            self.shift = False
         elif key == Key.space:
             QtCore.QMetaObject.invokeMethod(self.window, '_stop_recording', Qt.QueuedConnection)
 
@@ -156,6 +167,9 @@ class SuperWhisperWindow(QtWidgets.QWidget):
         self.transcriber = None
         self.host = host
         self.port = port
+        self.deepseek_r1_enabled = True
+        self.replacements = self._load_text_replacements()
+
 
         self.setWindowFlags(
         Qt.FramelessWindowHint |
@@ -203,7 +217,15 @@ class SuperWhisperWindow(QtWidgets.QWidget):
 
         self.hk = HotkeyListener(self)
         self.hk.start()
-    
+
+    def _load_text_replacements(self):
+        import json, os
+        path = os.path.join(os.path.dirname(__file__), "text_replacements.json")
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     @QtCore.pyqtSlot()
     def _stop_recording(self):
         if self.recorder.isRunning():
@@ -248,7 +270,102 @@ class SuperWhisperWindow(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(str)
     def _display_and_type(self, text):
+        if self.deepseek_r1_enabled:
+            for rule in self.replacements:
+                text = text.replace(rule["from"], rule["to"])
+        print(f"[Typed] {text}")
         self.kb.type(text)
+
+    
+    def _correct_text(self, text):
+        from ollama import Client
+        import re
+        import json
+        import os
+        import time
+
+        corrected_result = {"text": text}
+
+        # Show the window if hidden
+        if not self.isVisible():
+            self.show()
+            screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+            self.move((screen.width() - self.width()) // 2, screen.height() - self.height())
+
+        # Set correcting label
+        self.label.setText("Correcting text...")
+        self.label.setStyleSheet("color:blue; font:16pt 'Sans'; font-weight: bold;")
+
+        self.btn.hide()
+        self.plot.hide()
+        QtWidgets.QApplication.processEvents()
+
+        def correct_text_sync():
+            retries = 3
+            for attempt in range(1, retries + 1):
+                try:
+                    path = os.path.join(os.path.dirname(__file__), "text_replacements.json")
+                    with open(path, "r", encoding="utf-8") as file:
+                        replacements = json.load(file)
+
+                    replacement_str = json.dumps(replacements, indent=2)
+
+                    message = {
+                        'role': 'user',
+                        'content': (
+                            "You are a helpful AI assistant that corrects grammar, spelling, and punctuation.\n"
+                            "Use the reference dictionary provided below for any word replacements if needed.\n"
+                            f"Reference dictionary:\n{replacement_str}\n\n"
+                            "Wrap your reasoning inside <think> tags and final output inside <answer> tags.\n"
+                            "Example format: <think> reasoning here </think><answer> corrected sentence here </answer>\n\n"
+                            f'User: Please correct the following sentence: "{text}"\n'
+                            "Assistant:"
+                        )
+                    }
+
+                    client = Client()
+                    response = client.chat(model='deepseek-r1:latest', messages=[message])
+                    content = response.message.content
+                    match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+                    if match:
+                        corrected_result["text"] = match.group(1).strip()
+                        break
+                    else:
+                        print(f"[Retry {attempt}] No <answer> found.")
+                except Exception as e:
+                    print(f"[Retry {attempt}] Error during correction: {e}")
+
+                # show basic progress indicator (dot) in the label
+                self.label.setText(f"Correcting text{'.' * attempt}")
+                QtWidgets.QApplication.processEvents()
+                time.sleep(0.6)
+
+        correct_text_sync()
+
+        # Show result and type
+        print(f"[Typed] {corrected_result['text']}")
+        self.kb.type(corrected_result['text'])
+
+        # Reset UI
+        self.plot.show()
+        self.btn.show()
+        self.label.setText("Correction complete.")
+        self.label.setStyleSheet("color:green; font:12pt 'Sans'; font-weight: bold;")
+        QtCore.QTimer.singleShot(2000, lambda: self.label.setText("Press Ctrl+Space to Record"))
+        QtCore.QTimer.singleShot(2000, lambda: self.label.setStyleSheet("color:gray; font:9pt 'Sans';"))
+
+    
+    @QtCore.pyqtSlot()
+    def _correct_selected_text(self):
+        clipboard = QtWidgets.QApplication.clipboard()
+        selected_text = clipboard.text()
+
+        if selected_text.strip():
+            print(f"[INFO] Correcting selected text: {selected_text}")
+            self._correct_text(selected_text)
+        else:
+            print("[INFO] No text selected to correct.")
+
     
     @QtCore.pyqtSlot()
     def _close_window(self):
@@ -272,12 +389,22 @@ class SuperWhisperWindow(QtWidgets.QWidget):
  
     @QtCore.pyqtSlot(np.ndarray)
     def update_waveform(self, w):
+        # Smooth values over time using exponential moving average
         parts = np.array_split(np.abs(w), 60)
-        heights = [np.mean(p) for p in parts]
-        m = max(heights) or 1
-        heights = [h / m * 40 for h in heights]
-        x = np.arange(len(heights))
-        self.bars.setOpts(x=x, height=heights, width=0.8)
+        heights = np.array([np.mean(p) for p in parts])
+        m = np.max(heights) or 1
+        new_heights = heights / m * 40  # Normalize to a max height of 40
+
+        # If previous values exist, smooth the transition
+        if not hasattr(self, '_smoothed_heights'):
+            self._smoothed_heights = new_heights
+        else:
+            # Exponential moving average for smooth animation
+            self._smoothed_heights = 0.6 * self._smoothed_heights + 0.4 * new_heights
+
+        x = np.arange(len(self._smoothed_heights))
+        self.bars.setOpts(x=x, height=self._smoothed_heights, width=0.8)
+
 
     def closeEvent(self, event):
         self._close_window()
@@ -292,6 +419,4 @@ if __name__ == '__main__':
 
     app = QtWidgets.QApplication(sys.argv)
     win = SuperWhisperWindow(args.host, args.port)
-    # geom = app.primaryScreen().availableGeometry()
-    # win.move((geom.width() - win.width()) // 2, geom.height() - win.height())
     sys.exit(app.exec_())
