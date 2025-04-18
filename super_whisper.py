@@ -324,7 +324,7 @@ class SuperWhisperWindow(QtWidgets.QWidget):
                     }
 
                     client = Client()
-                    response = client.chat(model='deepseek-r1:latest', messages=[message])
+                    response = client.chat(model='phi4-mini', messages=[message])
                     content = response.message.content
                     match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
                     if match:
